@@ -780,7 +780,7 @@ export default function QuoteBuilderPage() {
                         <div className="flex-1 min-w-0">
                           <p className="text-sm font-medium">{preset.name}</p>
                           <p className="text-xs text-muted-foreground">
-                            ${parseFloat(preset.perPrintCost ?? "0").toFixed(2)}/unit + ${parseFloat(preset.setupFee ?? "0").toFixed(2)} setup
+                            ${(parseFloat(preset.inkCost ?? "0") + parseFloat(preset.perPrintCost ?? "0")).toFixed(2)}/unit + ${parseFloat(preset.setupFee ?? "0").toFixed(2)} setup
                           </p>
                         </div>
                       </div>
