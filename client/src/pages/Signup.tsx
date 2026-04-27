@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { useLocation } from "wouter";
 import { authClient } from "@/lib/auth-client";
+import { hasDraft } from "@/lib/quoteDraft";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -35,7 +36,7 @@ export default function Signup() {
       toast.error(error.message ?? "Sign up failed");
       return;
     }
-    setLocation("/");
+    setLocation(hasDraft() ? "/quotes/new" : "/");
   }
 
   return (

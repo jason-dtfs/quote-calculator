@@ -10,11 +10,16 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
-import { trpc } from "@/lib/trpc";
+import {
+  useDeleteQuote,
+  useDuplicateQuote,
+  useQuotesList,
+  useUpdateQuoteStatus,
+} from "@/_core/hooks/useQuotes";
+import { useNotifyMutationError, useNotifySaved } from "@/_core/hooks/useNotifySaved";
 import { STATUS_COLORS, STATUS_LABELS, formatCurrency } from "@/lib/pricing";
 import { Copy, Eye, FileText, MoreHorizontal, Plus, Trash2 } from "lucide-react";
 import { useLocation } from "wouter";
-import { toast } from "sonner";
 import { useState } from "react";
 import {
   AlertDialog,
@@ -32,23 +37,43 @@ export default function QuotesPage() {
   const [deleteId, setDeleteId] = useState<number | null>(null);
   const [statusFilter, setStatusFilter] = useState<string>("all");
 
-  // Calling settings.get triggers the first-login seed (blanks + presets)
-  trpc.settings.get.useQuery();
-  const { data: quotes, isLoading, refetch } = trpc.quotes.list.useQuery();
-  const deleteMutation = trpc.quotes.delete.useMutation({
-    onSuccess: () => { toast.success("Quote deleted"); refetch(); },
-    onError: () => toast.error("Failed to delete quote"),
-  });
-  const duplicateMutation = trpc.quotes.duplicate.useMutation({
-    onSuccess: (data) => {
-      toast.success(`Quote duplicated as ${data.quoteNumber}`);
-      refetch();
-    },
-    onError: () => toast.error("Failed to duplicate quote"),
-  });
-  const updateStatusMutation = trpc.quotes.updateStatus.useMutation({
-    onSuccess: () => { toast.success("Status updated"); refetch(); },
-  });
+  const notifySaved = useNotifySaved();
+  const notifyError = useNotifyMutationError();
+
+  const { data: quotes, isLoading, refetch } = useQuotesList();
+  const deleteMutation = useDeleteQuote();
+  const duplicateMutation = useDuplicateQuote();
+  const updateStatusMutation = useUpdateQuoteStatus();
+
+  const handleDelete = (id: number) => {
+    deleteMutation.mutate(
+      { id },
+      {
+        onSuccess: () => { notifySaved("Quote deleted"); refetch(); },
+        onError: (err) => notifyError(err, "Failed to delete quote"),
+      }
+    );
+  };
+
+  const handleDuplicate = (id: number) => {
+    duplicateMutation.mutate(
+      { id },
+      {
+        onSuccess: (data) => { notifySaved(`Quote duplicated as ${data.quoteNumber}`); refetch(); },
+        onError: (err) => notifyError(err, "Failed to duplicate quote"),
+      }
+    );
+  };
+
+  const handleUpdateStatus = (id: number, status: "draft" | "sent" | "accepted") => {
+    updateStatusMutation.mutate(
+      { id, status },
+      {
+        onSuccess: () => { notifySaved("Status updated"); refetch(); },
+        onError: (err) => notifyError(err, "Failed to update status"),
+      }
+    );
+  };
 
   const filtered = quotes?.filter((q) => statusFilter === "all" || q.status === statusFilter) ?? [];
 
@@ -184,24 +209,24 @@ export default function QuotesPage() {
                         <DropdownMenuItem onClick={(e) => { e.stopPropagation(); setLocation(`/quotes/${quote.id}`); }}>
                           <Eye className="mr-2 h-4 w-4" /> View
                         </DropdownMenuItem>
-                        <DropdownMenuItem onClick={(e) => { e.stopPropagation(); duplicateMutation.mutate({ id: quote.id }); }}>
+                        <DropdownMenuItem onClick={(e) => { e.stopPropagation(); handleDuplicate(quote.id); }}>
                           <Copy className="mr-2 h-4 w-4" /> Duplicate
                         </DropdownMenuItem>
                         <DropdownMenuSeparator />
                         <DropdownMenuItem
-                          onClick={(e) => { e.stopPropagation(); updateStatusMutation.mutate({ id: quote.id, status: "draft" }); }}
+                          onClick={(e) => { e.stopPropagation(); handleUpdateStatus(quote.id, "draft"); }}
                           disabled={quote.status === "draft"}
                         >
                           Mark as Draft
                         </DropdownMenuItem>
                         <DropdownMenuItem
-                          onClick={(e) => { e.stopPropagation(); updateStatusMutation.mutate({ id: quote.id, status: "sent" }); }}
+                          onClick={(e) => { e.stopPropagation(); handleUpdateStatus(quote.id, "sent"); }}
                           disabled={quote.status === "sent"}
                         >
                           Mark as Sent
                         </DropdownMenuItem>
                         <DropdownMenuItem
-                          onClick={(e) => { e.stopPropagation(); updateStatusMutation.mutate({ id: quote.id, status: "accepted" }); }}
+                          onClick={(e) => { e.stopPropagation(); handleUpdateStatus(quote.id, "accepted"); }}
                           disabled={quote.status === "accepted"}
                         >
                           Mark as Accepted
@@ -236,7 +261,7 @@ export default function QuotesPage() {
             <AlertDialogCancel>Cancel</AlertDialogCancel>
             <AlertDialogAction
               className="bg-destructive hover:bg-destructive/90 text-white"
-              onClick={() => { if (deleteId) deleteMutation.mutate({ id: deleteId }); setDeleteId(null); }}
+              onClick={() => { if (deleteId) handleDelete(deleteId); setDeleteId(null); }}
             >
               Delete
             </AlertDialogAction>

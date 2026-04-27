@@ -6,14 +6,23 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Slider } from "@/components/ui/slider";
 import { Switch } from "@/components/ui/switch";
 import { Skeleton } from "@/components/ui/skeleton";
-import { trpc } from "@/lib/trpc";
+import { useSettings, useUpdateSettings, useUploadLogo } from "@/_core/hooks/useSettings";
+import { useNotifyMutationError, useNotifySaved } from "@/_core/hooks/useNotifySaved";
 import { useRef, useState, useEffect } from "react";
-import { toast } from "sonner";
 import { Camera, Settings } from "lucide-react";
 
+// Logo URL builder: anonymous mode stores the logo as a `data:` URL inline
+// in localStorage; authed mode stores a storage key resolved through
+// `/api/uploads/${key}`. Either format is detected here.
+function resolveLogoUrl(shopLogo: string | null | undefined): string | null {
+  if (!shopLogo) return null;
+  return shopLogo.startsWith("data:") ? shopLogo : `/api/uploads/${shopLogo}`;
+}
+
 export default function SettingsPage() {
-  const { data: settings, isLoading, refetch } = trpc.settings.get.useQuery();
-  const utils = trpc.useUtils();
+  const { data: settings, isLoading, refetch } = useSettings();
+  const notifySaved = useNotifySaved();
+  const notifyError = useNotifyMutationError();
 
   const [shopName, setShopName] = useState("");
   const [defaultTaxRate, setDefaultTaxRate] = useState("0");
@@ -34,22 +43,22 @@ export default function SettingsPage() {
       setMarketingOptIn(settings.marketingOptIn ?? true);
       setShopLogoSize((settings.shopLogoSize as "small" | "medium" | "large") ?? "medium");
       setShopLogoPosition((settings.shopLogoPosition as "top-left" | "top-center" | "top-right") ?? "top-left");
-      if (settings.shopLogo) setLogoPreview(settings.shopLogo);
+      setLogoPreview(resolveLogoUrl(settings.shopLogo));
     }
   }, [settings]);
 
-  const updateMutation = trpc.settings.update.useMutation({
-    onSuccess: () => { toast.success("Settings saved"); refetch(); utils.settings.get.invalidate(); },
-    onError: () => toast.error("Failed to save settings"),
-  });
+  const updateMutation = useUpdateSettings();
+  const uploadLogoMutation = useUploadLogo();
 
-  const uploadLogoMutation = trpc.settings.uploadLogo.useMutation({
-    onSuccess: (data) => { toast.success("Logo uploaded"); setLogoPreview(data.url); refetch(); },
-    onError: () => toast.error("Failed to upload logo"),
-  });
+  function runUpdate(input: Parameters<typeof updateMutation.mutate>[0]) {
+    updateMutation.mutate(input, {
+      onSuccess: () => { notifySaved("Settings saved"); refetch(); },
+      onError: (err) => notifyError(err, "Failed to save settings"),
+    });
+  }
 
   function handleSave() {
-    updateMutation.mutate({
+    runUpdate({
       shopName,
       defaultTaxRate,
       defaultMargin,
@@ -63,11 +72,21 @@ export default function SettingsPage() {
   function handleLogoChange(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
     if (!file) return;
-    if (file.size > 2 * 1024 * 1024) { toast.error("Logo must be under 2MB"); return; }
+    if (file.size > 2 * 1024 * 1024) { notifyError(new Error("size"), "Logo must be under 2MB"); return; }
     const reader = new FileReader();
     reader.onload = (ev) => {
       const base64 = (ev.target?.result as string).split(",")[1];
-      uploadLogoMutation.mutate({ base64, mimeType: file.type, fileName: file.name });
+      uploadLogoMutation.mutate(
+        { base64, mimeType: file.type, fileName: file.name },
+        {
+          onSuccess: (data) => {
+            notifySaved("Logo uploaded");
+            setLogoPreview(resolveLogoUrl(data.key));
+            refetch();
+          },
+          onError: (err) => notifyError(err, "Failed to upload logo"),
+        }
+      );
     };
     reader.readAsDataURL(file);
     e.target.value = "";
@@ -165,6 +184,10 @@ export default function SettingsPage() {
                     </SelectContent>
                   </Select>
                 </div>
+                {/* Currently unused — PDF export hard-codes a single canonical
+                    layout (logo on the left, shop name beside it). The dropdown
+                    is preserved here so the existing user setting isn't lost;
+                    revisit if there's demand for multiple PDF layouts. */}
                 <div className="space-y-1.5">
                   <Label className="text-xs font-medium">Logo Position on PDF</Label>
                   <Select value={shopLogoPosition} onValueChange={(v) => setShopLogoPosition(v as "top-left" | "top-center" | "top-right")}>

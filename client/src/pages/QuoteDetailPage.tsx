@@ -4,7 +4,6 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Separator } from "@/components/ui/separator";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
-import { trpc } from "@/lib/trpc";
 import {
   BlankSnapshot,
   PrintSnapshot,
@@ -16,31 +15,95 @@ import {
   formatQtySummary,
   totalQty,
 } from "@/lib/pricing";
-import { DTFSTATION_LOGO_URL } from "@/lib/assets";
+import { useAuth } from "@/_core/hooks/useAuth";
+import { useQuoteById, useUpdateQuoteStatus } from "@/_core/hooks/useQuotes";
+import { useSettings } from "@/_core/hooks/useSettings";
+import { useNotifyMutationError, useNotifySaved } from "@/_core/hooks/useNotifySaved";
+import { SignupPromptDialog } from "@/components/SignupPromptDialog";
+import { APP_NAME } from "@shared/constants";
 import {
   ArrowLeft,
-  Check,
   Clipboard,
   Download,
   Edit2,
   FileText,
-  Share2,
 } from "lucide-react";
 import { useParams, useLocation } from "wouter";
+import { useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 import jsPDF from "jspdf";
+
+const PENDING_EXPORT_KEY = "qc:pending-quote-export";
+
+type ExportAction = "copy" | "csv" | "pdf";
 
 export default function QuoteDetailPage() {
   const params = useParams<{ id: string }>();
   const quoteId = parseInt(params.id);
   const [, setLocation] = useLocation();
 
-  const { data: quote, isLoading, refetch } = trpc.quotes.get.useQuery({ id: quoteId });
-  const { data: settings } = trpc.settings.get.useQuery();
+  const { user } = useAuth();
+  const { data: quote, isLoading, refetch } = useQuoteById(quoteId);
+  const { data: settings } = useSettings();
+  const updateStatusMutation = useUpdateQuoteStatus();
+  const notifySaved = useNotifySaved();
+  const notifyError = useNotifyMutationError();
 
-  const updateStatusMutation = trpc.quotes.updateStatus.useMutation({
-    onSuccess: () => { toast.success("Status updated"); refetch(); },
-  });
+  const [signupPromptOpen, setSignupPromptOpen] = useState(false);
+  const autoExportFiredRef = useRef(false);
+
+  /**
+   * Anonymous users hitting Copy/CSV/PDF: stash the quote + intended action,
+   * then prompt for signup. After signup, App.tsx's PostAuthCoordinator
+   * silently migrates everything and routes back to /quotes/{newId}?autoExport=...
+   * which re-fires the action below via the auto-trigger effect.
+   */
+  /**
+   * After post-signup migration, App.tsx routes the user to
+   * /quotes/{newId}?autoExport={action}. Once the quote is loaded, fire the
+   * action and strip the param. Guarded against re-firing on re-renders.
+   */
+  useEffect(() => {
+    if (autoExportFiredRef.current) return;
+    if (!quote || !user) return;
+    const params = new URLSearchParams(window.location.search);
+    const action = params.get("autoExport") as ExportAction | null;
+    if (!action) return;
+    autoExportFiredRef.current = true;
+    // Run the matching action. We define them after this effect; the closure
+    // captures the latest references via setTimeout deferral.
+    setTimeout(() => {
+      if (action === "copy") copyToClipboard();
+      else if (action === "csv") exportCSV();
+      else if (action === "pdf") exportPDF();
+      // Strip the query param so the action doesn't re-fire on a refresh.
+      const url = new URL(window.location.href);
+      url.searchParams.delete("autoExport");
+      window.history.replaceState({}, "", url.toString());
+    }, 0);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [quote, user]);
+
+  function handleExportAttempt(action: ExportAction, fire: () => void) {
+    if (user) {
+      fire();
+      return;
+    }
+    if (!quote) return;
+    try {
+      localStorage.setItem(
+        PENDING_EXPORT_KEY,
+        JSON.stringify({
+          quoteNumber: quote.quoteNumber,
+          action,
+          capturedAt: Date.now(),
+        })
+      );
+    } catch {
+      /* fall through — without the stash the auto-trigger won't run, but the prompt still works */
+    }
+    setSignupPromptOpen(true);
+  }
 
   const currencySymbol = settings?.currencySymbol ?? "$";
 
@@ -145,12 +208,25 @@ export default function QuoteDetailPage() {
     const margin = 20;
     let y = margin;
 
-    // Header
+    // Header — canonical layout: logo on the left, shop name to the right of
+    // the logo (vertically centered against it), or stacked alone if only one
+    // of the two is configured.
+    //
+    // NOTE: settings.shopLogoPosition (top-left / top-center / top-right) is
+    // intentionally not honored here. The Settings UI still exposes the
+    // dropdown but it currently has no effect on the PDF; revisit if there's
+    // demand for multiple layouts.
     const logoSize = settings?.shopLogoSize ?? "medium";
-    const logoH = logoSize === "small" ? 12 : logoSize === "large" ? 22 : 16;
-    const logoW = logoH * 1.2;
+    const MAX_LOGO_W = 40; // mm — cap for very wide logos (banners, etc.)
+    let logoH = logoSize === "small" ? 12 : logoSize === "large" ? 22 : 16;
+    let logoW = logoH; // placeholder; recomputed from real aspect ratio after load
 
-    // Try to load shop logo
+    // Resolve the logo to a data URL up front so a failed load falls cleanly
+    // through to the name-only / neither branches below. The actual width is
+    // computed from the image's natural aspect ratio (naturalWidth / Height)
+    // and clamped to MAX_LOGO_W; if clamped, height scales down proportionally
+    // so the logo never gets stretched or squished.
+    let logoDataUrl: string | null = null;
     if (settings?.shopLogo) {
       try {
         const img = new Image();
@@ -158,29 +234,54 @@ export default function QuoteDetailPage() {
         await new Promise<void>((res, rej) => {
           img.onload = () => res();
           img.onerror = () => rej();
-          img.src = settings.shopLogo!;
+          // Anonymous mode stores the logo as a data: URL inline; authed mode
+          // stores a storage key resolved through /api/uploads/. Detect either.
+          img.src = settings.shopLogo.startsWith("data:")
+            ? settings.shopLogo
+            : `/api/uploads/${settings.shopLogo}`;
         });
+        const aspect = img.naturalHeight > 0 ? img.naturalWidth / img.naturalHeight : 1;
+        logoW = logoH * aspect;
+        if (logoW > MAX_LOGO_W) {
+          logoW = MAX_LOGO_W;
+          logoH = MAX_LOGO_W / aspect;
+        }
         const canvas = document.createElement("canvas");
         canvas.width = img.naturalWidth;
         canvas.height = img.naturalHeight;
         const ctx = canvas.getContext("2d")!;
         ctx.drawImage(img, 0, 0);
-        const dataUrl = canvas.toDataURL("image/png");
-        const pos = settings.shopLogoPosition ?? "top-left";
-        const logoX = pos === "top-center" ? (pageW - logoW) / 2 : pos === "top-right" ? pageW - margin - logoW : margin;
-        doc.addImage(dataUrl, "PNG", logoX, y, logoW, logoH);
+        logoDataUrl = canvas.toDataURL("image/png");
       } catch {
         // logo load failed silently
       }
     }
 
-    // Shop name
-    if (settings?.shopName) {
+    const hasLogo = !!logoDataUrl;
+    const hasName = !!settings?.shopName;
+
+    if (hasLogo) {
+      doc.addImage(logoDataUrl!, "PNG", margin, y, logoW, logoH);
+    }
+
+    if (hasName) {
       doc.setFont("helvetica", "bold");
       doc.setFontSize(14);
       doc.setTextColor(30, 30, 30);
-      doc.text(settings.shopName, margin, y + 6);
+      if (hasLogo) {
+        // Right of logo, vertically centered against it. The +2.5mm offset is
+        // ~half the cap height of 14pt-bold helvetica, which gives clean
+        // optical centering when paired with jsPDF's baseline-aligned text.
+        doc.text(settings!.shopName!, margin + logoW + 6, y + logoH / 2 + 2.5);
+      } else {
+        doc.text(settings!.shopName!, margin, y + 5);
+      }
+    }
+
+    if (hasLogo) {
       y += logoH + 4;
+    } else if (hasName) {
+      y += 8 + 4;
     } else {
       y += 10;
     }
@@ -329,7 +430,7 @@ export default function QuoteDetailPage() {
     doc.setFont("helvetica", "normal");
     doc.setFontSize(7.5);
     doc.setTextColor(160, 160, 160);
-    doc.text("Generated with DTF Station Quote Calculator", pageW / 2, 287, { align: "center" });
+    doc.text(`Generated with DTF Station ${APP_NAME}`, pageW / 2, 287, { align: "center" });
 
     doc.save(`${quote!.quoteNumber}.pdf`);
     toast.success("PDF downloaded");
@@ -367,19 +468,27 @@ export default function QuoteDetailPage() {
 
       {/* Actions */}
       <div className="flex flex-wrap items-center gap-2 mb-6">
-        <Button variant="outline" size="sm" className="gap-1.5" onClick={copyToClipboard}>
+        <Button variant="outline" size="sm" className="gap-1.5" onClick={() => handleExportAttempt("copy", copyToClipboard)}>
           <Clipboard className="h-3.5 w-3.5" /> Copy
         </Button>
-        <Button variant="outline" size="sm" className="gap-1.5" onClick={exportCSV}>
+        <Button variant="outline" size="sm" className="gap-1.5" onClick={() => handleExportAttempt("csv", exportCSV)}>
           <Download className="h-3.5 w-3.5" /> CSV
         </Button>
-        <Button size="sm" className="gap-1.5 bg-primary hover:bg-primary/90 text-white" onClick={exportPDF}>
+        <Button size="sm" className="gap-1.5 bg-primary hover:bg-primary/90 text-white" onClick={() => handleExportAttempt("pdf", exportPDF)}>
           <FileText className="h-3.5 w-3.5" /> PDF
         </Button>
         <div className="ml-auto">
           <Select
             value={quote.status}
-            onValueChange={(v) => updateStatusMutation.mutate({ id: quoteId, status: v as "draft" | "sent" | "accepted" })}
+            onValueChange={(v) =>
+              updateStatusMutation.mutate(
+                { id: quoteId, status: v as "draft" | "sent" | "accepted" },
+                {
+                  onSuccess: () => { notifySaved("Status updated"); refetch(); },
+                  onError: (err) => notifyError(err, "Failed to update status"),
+                }
+              )
+            }
           >
             <SelectTrigger className="h-8 text-xs w-36">
               <SelectValue />
@@ -488,9 +597,18 @@ export default function QuoteDetailPage() {
 
       {/* Footer branding */}
       <div className="flex items-center justify-center gap-2 mt-8 pb-4">
-        <img src={DTFSTATION_LOGO_URL} alt="DTF Station" className="h-5 w-auto opacity-40" />
-        <span className="text-xs text-muted-foreground/60">DTF Station Quote Calculator</span>
+        <span className="text-xs text-muted-foreground/60">DTF Station {APP_NAME}</span>
       </div>
+
+      {/* Sign-up prompt for anonymous Copy / CSV / PDF attempts. The action is
+          stashed in qc:pending-quote-export before this dialog opens; after
+          signup, App.tsx silently migrates and re-fires the action. */}
+      <SignupPromptDialog
+        open={signupPromptOpen}
+        onOpenChange={setSignupPromptOpen}
+        title="Sign up to download your quote"
+        description="Create a free account so we can save and export your quote. We'll bring you right back to it."
+      />
     </div>
   );
 }

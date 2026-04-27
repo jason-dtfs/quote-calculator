@@ -1,5 +1,6 @@
 import {
   boolean,
+  index,
   integer,
   jsonb,
   numeric,
@@ -130,50 +131,87 @@ export type Verification = typeof verification.$inferSelect;
 
 // ─── Blanks ───────────────────────────────────────────────────────────────────
 
-export const blanks = pgTable("blanks", {
-  id: serial("id").primaryKey(),
-  userId: text("userId")
-    .notNull()
-    .references(() => user.id, { onDelete: "cascade" }),
-  brand: varchar("brand", { length: 255 }).notNull(),
-  garmentType: varchar("garmentType", { length: 255 }).notNull(),
-  modelName: varchar("modelName", { length: 255 }).notNull(),
-  variant: varchar("variant", { length: 255 }),
-  priceSXL: numeric("priceSXL", { precision: 8, scale: 2 }).notNull().default("0"),
-  price2XL: numeric("price2XL", { precision: 8, scale: 2 }).notNull().default("0"),
-  price3XL: numeric("price3XL", { precision: 8, scale: 2 }).notNull().default("0"),
-  price4XLPlus: numeric("price4XLPlus", { precision: 8, scale: 2 }).notNull().default("0"),
-  createdAt: timestamp("createdAt", { withTimezone: true, mode: "date" })
-    .notNull()
-    .defaultNow(),
-  updatedAt: timestamp("updatedAt", { withTimezone: true, mode: "date" })
-    .notNull()
-    .defaultNow()
-    .$onUpdate(() => new Date()),
-});
+export const blanks = pgTable(
+  "blanks",
+  {
+    id: serial("id").primaryKey(),
+    userId: text("userId")
+      .notNull()
+      .references(() => user.id, { onDelete: "cascade" }),
+    brand: varchar("brand", { length: 255 }).notNull(),
+    garmentType: varchar("garmentType", { length: 255 }).notNull(),
+    modelName: varchar("modelName", { length: 255 }).notNull(),
+    variant: varchar("variant", { length: 255 }),
+    // One-size flag short-circuits all six tier prices; a single priceOS is
+    // used instead. priceOS is nullable so the column is meaningful only when
+    // isOneSize is true. The zod input layer still coerces empty string → "0"
+    // for consistency, so DB rows in practice carry "0" rather than null.
+    isOneSize: boolean("isOneSize").notNull().default(false),
+    priceOS: numeric("priceOS", { precision: 8, scale: 2 }),
+    priceXS: numeric("priceXS", { precision: 8, scale: 2 }).notNull().default("0"),
+    priceSXL: numeric("priceSXL", { precision: 8, scale: 2 }).notNull().default("0"),
+    price2XL: numeric("price2XL", { precision: 8, scale: 2 }).notNull().default("0"),
+    price3XL: numeric("price3XL", { precision: 8, scale: 2 }).notNull().default("0"),
+    price4XL: numeric("price4XL", { precision: 8, scale: 2 }).notNull().default("0"),
+    price5XL: numeric("price5XL", { precision: 8, scale: 2 }).notNull().default("0"),
+    // When set, this row is the user's customization of a system catalog item
+    // (e.g. "system:gildan-5000-tshirt"). When also isHidden=true, the row is a
+    // tombstone hiding that system item from the user's view. When isHidden=false
+    // and the data fields (brand/modelName) are empty, this is a position-only
+    // fork created by drag-reorder — merge logic substitutes the system data.
+    overridesSystemId: text("overridesSystemId"),
+    isHidden: boolean("isHidden").notNull().default(false),
+    sortOrder: integer("sortOrder").notNull().default(0),
+    createdAt: timestamp("createdAt", { withTimezone: true, mode: "date" })
+      .notNull()
+      .defaultNow(),
+    updatedAt: timestamp("updatedAt", { withTimezone: true, mode: "date" })
+      .notNull()
+      .defaultNow()
+      .$onUpdate(() => new Date()),
+  },
+  (table) => ({
+    userOverrideIdx: index("blanks_user_override_idx").on(
+      table.userId,
+      table.overridesSystemId,
+    ),
+  }),
+);
 
 export type Blank = typeof blanks.$inferSelect;
 export type InsertBlank = typeof blanks.$inferInsert;
 
 // ─── Print Presets ────────────────────────────────────────────────────────────
 
-export const printPresets = pgTable("print_presets", {
-  id: serial("id").primaryKey(),
-  userId: text("userId")
-    .notNull()
-    .references(() => user.id, { onDelete: "cascade" }),
-  name: varchar("name", { length: 255 }).notNull(),
-  inkCost: numeric("inkCost", { precision: 8, scale: 2 }).notNull().default("0"),
-  setupFee: numeric("setupFee", { precision: 8, scale: 2 }).notNull().default("0"),
-  perPrintCost: numeric("perPrintCost", { precision: 8, scale: 2 }).notNull().default("0"),
-  createdAt: timestamp("createdAt", { withTimezone: true, mode: "date" })
-    .notNull()
-    .defaultNow(),
-  updatedAt: timestamp("updatedAt", { withTimezone: true, mode: "date" })
-    .notNull()
-    .defaultNow()
-    .$onUpdate(() => new Date()),
-});
+export const printPresets = pgTable(
+  "print_presets",
+  {
+    id: serial("id").primaryKey(),
+    userId: text("userId")
+      .notNull()
+      .references(() => user.id, { onDelete: "cascade" }),
+    name: varchar("name", { length: 255 }).notNull(),
+    inkCost: numeric("inkCost", { precision: 8, scale: 2 }).notNull().default("0"),
+    setupFee: numeric("setupFee", { precision: 8, scale: 2 }).notNull().default("0"),
+    perPrintCost: numeric("perPrintCost", { precision: 8, scale: 2 }).notNull().default("0"),
+    overridesSystemId: text("overridesSystemId"),
+    isHidden: boolean("isHidden").notNull().default(false),
+    sortOrder: integer("sortOrder").notNull().default(0),
+    createdAt: timestamp("createdAt", { withTimezone: true, mode: "date" })
+      .notNull()
+      .defaultNow(),
+    updatedAt: timestamp("updatedAt", { withTimezone: true, mode: "date" })
+      .notNull()
+      .defaultNow()
+      .$onUpdate(() => new Date()),
+  },
+  (table) => ({
+    userOverrideIdx: index("print_presets_user_override_idx").on(
+      table.userId,
+      table.overridesSystemId,
+    ),
+  }),
+);
 
 export type PrintPreset = typeof printPresets.$inferSelect;
 export type InsertPrintPreset = typeof printPresets.$inferInsert;
@@ -219,6 +257,8 @@ export const quoteItems = pgTable("quote_items", {
   sortOrder: integer("sortOrder").notNull().default(0),
   blankId: integer("blankId").references(() => blanks.id, { onDelete: "set null" }),
   blankSnapshot: jsonb("blankSnapshot"),
+  qtyOS: integer("qtyOS").notNull().default(0),
+  qtyXS: integer("qtyXS").notNull().default(0),
   qtyS: integer("qtyS").notNull().default(0),
   qtyM: integer("qtyM").notNull().default(0),
   qtyL: integer("qtyL").notNull().default(0),
@@ -226,6 +266,7 @@ export const quoteItems = pgTable("quote_items", {
   qty2XL: integer("qty2XL").notNull().default(0),
   qty3XL: integer("qty3XL").notNull().default(0),
   qty4XL: integer("qty4XL").notNull().default(0),
+  qty5XL: integer("qty5XL").notNull().default(0),
   lineNotes: text("lineNotes"),
   blankCost: numeric("blankCost", { precision: 10, scale: 2 }).notNull().default("0"),
   printCost: numeric("printCost", { precision: 10, scale: 2 }).notNull().default("0"),

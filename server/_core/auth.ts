@@ -39,12 +39,35 @@ export const auth = betterAuth({
   },
   secret: process.env.BETTER_AUTH_SECRET,
   baseURL: process.env.BETTER_AUTH_URL,
-  trustedOrigins: [
-    "http://localhost:3000",
-    "http://localhost:3001",
-    "http://localhost:3002",
-    "http://localhost:5173",
-  ],
+  // Resolved per-request so dev gets any localhost port automatically while
+  // production stays tight to whatever's configured via env.
+  //
+  //   BETTER_AUTH_URL              — primary deploy URL (always trusted)
+  //   BETTER_AUTH_TRUSTED_ORIGINS  — optional comma-separated extras for
+  //                                  multi-domain deploys (e.g. preview URLs)
+  //
+  // In NODE_ENV=development we additionally trust the request's own Origin
+  // header if it matches /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.
+  // The dev port shifts as ports get held, so a fixed list keeps biting us.
+  trustedOrigins: (request) => {
+    const list: string[] = [];
+    if (process.env.BETTER_AUTH_URL) list.push(process.env.BETTER_AUTH_URL);
+    for (const o of (process.env.BETTER_AUTH_TRUSTED_ORIGINS ?? "").split(",")) {
+      const t = o.trim();
+      if (t) list.push(t);
+    }
+    // Better Auth invokes trustedOrigins twice: once at init with no request
+    // (for static context setup) and again per-request. Only the per-request
+    // call gets the dev-localhost augmentation; the init call returns the
+    // explicit-config list alone.
+    if (request && process.env.NODE_ENV !== "production") {
+      const origin = request.headers.get("origin");
+      if (origin && /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)) {
+        list.push(origin);
+      }
+    }
+    return list;
+  },
 });
 
 export type Auth = typeof auth;

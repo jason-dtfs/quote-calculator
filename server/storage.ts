@@ -1,97 +1,100 @@
-// Preconfigured storage helpers for Manus WebDev templates
-// Uploads via Forge Server presigned URL to S3 (PUT direct).
-// Downloads return /manus-storage/{key} paths served via 307 redirect.
+import "dotenv/config";
+import { promises as fs } from "fs";
+import path from "path";
 
-import { ENV } from "./_core/env";
+/**
+ * Provider-agnostic file storage.
+ * Designed for small files (logos, attachments). For large/streaming use cases,
+ * extend the interface with stream-based operations.
+ */
+export interface StoredFile {
+  data: Buffer;
+  contentType: string;
+}
 
-function getForgeConfig() {
-  const forgeUrl = ENV.forgeApiUrl;
-  const forgeKey = ENV.forgeApiKey;
+export interface Storage {
+  /** One-time setup: directory creation, credential check, etc. Called at server boot. */
+  init?(): Promise<void>;
+  put(key: string, data: Buffer, contentType: string): Promise<void>;
+  get(key: string): Promise<StoredFile | null>;
+  delete(key: string): Promise<void>;
+  exists(key: string): Promise<boolean>;
+}
 
-  if (!forgeUrl || !forgeKey) {
-    throw new Error(
-      "Storage config missing: set BUILT_IN_FORGE_API_URL and BUILT_IN_FORGE_API_KEY",
-    );
+const CONTENT_TYPE_BY_EXT: Record<string, string> = {
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".gif": "image/gif",
+  ".webp": "image/webp",
+  ".svg": "image/svg+xml",
+};
+
+function inferContentType(key: string): string {
+  const ext = path.extname(key).toLowerCase();
+  return CONTENT_TYPE_BY_EXT[ext] ?? "application/octet-stream";
+}
+
+export class InvalidStorageKeyError extends Error {
+  constructor(key: string) {
+    super(`Invalid storage key: ${key}`);
+    this.name = "InvalidStorageKeyError";
+  }
+}
+
+function safeJoin(root: string, key: string): string {
+  const normalized = path.normalize(key).replace(/^[/\\]+/, "");
+  const resolved = path.resolve(root, normalized);
+  const rootResolved = path.resolve(root);
+  if (resolved !== rootResolved && !resolved.startsWith(rootResolved + path.sep)) {
+    throw new InvalidStorageKeyError(key);
+  }
+  return resolved;
+}
+
+export class LocalDiskStorage implements Storage {
+  constructor(private readonly rootDir: string) {}
+
+  async init(): Promise<void> {
+    await fs.mkdir(this.rootDir, { recursive: true });
   }
 
-  return { forgeUrl: forgeUrl.replace(/\/+$/, ""), forgeKey };
-}
-
-function normalizeKey(relKey: string): string {
-  return relKey.replace(/^\/+/, "");
-}
-
-function appendHashSuffix(relKey: string): string {
-  const hash = crypto.randomUUID().replace(/-/g, "").slice(0, 8);
-  const lastDot = relKey.lastIndexOf(".");
-  if (lastDot === -1) return `${relKey}_${hash}`;
-  return `${relKey.slice(0, lastDot)}_${hash}${relKey.slice(lastDot)}`;
-}
-
-export async function storagePut(
-  relKey: string,
-  data: Buffer | Uint8Array | string,
-  contentType = "application/octet-stream",
-): Promise<{ key: string; url: string }> {
-  const { forgeUrl, forgeKey } = getForgeConfig();
-  const key = appendHashSuffix(normalizeKey(relKey));
-
-  // 1. Get presigned PUT URL from Forge
-  const presignUrl = new URL("v1/storage/presign/put", forgeUrl + "/");
-  presignUrl.searchParams.set("path", key);
-
-  const presignResp = await fetch(presignUrl, {
-    headers: { Authorization: `Bearer ${forgeKey}` },
-  });
-
-  if (!presignResp.ok) {
-    const msg = await presignResp.text().catch(() => presignResp.statusText);
-    throw new Error(`Storage presign failed (${presignResp.status}): ${msg}`);
+  async put(key: string, data: Buffer, _contentType: string): Promise<void> {
+    const filePath = safeJoin(this.rootDir, key);
+    await fs.mkdir(path.dirname(filePath), { recursive: true });
+    await fs.writeFile(filePath, data);
   }
 
-  const { url: s3Url } = (await presignResp.json()) as { url: string };
-  if (!s3Url) throw new Error("Forge returned empty presign URL");
-
-  // 2. PUT file directly to S3
-  const blob =
-    typeof data === "string"
-      ? new Blob([data], { type: contentType })
-      : new Blob([data as any], { type: contentType });
-
-  const uploadResp = await fetch(s3Url, {
-    method: "PUT",
-    headers: { "Content-Type": contentType },
-    body: blob,
-  });
-
-  if (!uploadResp.ok) {
-    throw new Error(`Storage upload to S3 failed (${uploadResp.status})`);
+  async get(key: string): Promise<StoredFile | null> {
+    const filePath = safeJoin(this.rootDir, key);
+    try {
+      const data = await fs.readFile(filePath);
+      return { data, contentType: inferContentType(key) };
+    } catch (err: unknown) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
+      throw err;
+    }
   }
 
-  return { key, url: `/manus-storage/${key}` };
-}
-
-export async function storageGet(relKey: string): Promise<{ key: string; url: string }> {
-  const key = normalizeKey(relKey);
-  return { key, url: `/manus-storage/${key}` };
-}
-
-export async function storageGetSignedUrl(relKey: string): Promise<string> {
-  const { forgeUrl, forgeKey } = getForgeConfig();
-  const key = normalizeKey(relKey);
-
-  const getUrl = new URL("v1/storage/presign/get", forgeUrl + "/");
-  getUrl.searchParams.set("path", key);
-
-  const resp = await fetch(getUrl, {
-    headers: { Authorization: `Bearer ${forgeKey}` },
-  });
-
-  if (!resp.ok) {
-    const msg = await resp.text().catch(() => resp.statusText);
-    throw new Error(`Storage signed URL failed (${resp.status}): ${msg}`);
+  async delete(key: string): Promise<void> {
+    const filePath = safeJoin(this.rootDir, key);
+    try {
+      await fs.unlink(filePath);
+    } catch (err: unknown) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+    }
   }
 
-  const { url } = (await resp.json()) as { url: string };
-  return url;
+  async exists(key: string): Promise<boolean> {
+    const filePath = safeJoin(this.rootDir, key);
+    try {
+      await fs.access(filePath);
+      return true;
+    } catch {
+      return false;
+    }
+  }
 }
+
+export const uploadsRootDir = process.env.UPLOADS_DIR ?? "./uploads";
+export const storage: Storage = new LocalDiskStorage(uploadsRootDir);

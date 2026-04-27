@@ -10,7 +10,11 @@ import { Separator } from "@/components/ui/separator";
 import { Slider } from "@/components/ui/slider";
 import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
-import { trpc } from "@/lib/trpc";
+import { useBlanksList } from "@/_core/hooks/useBlanks";
+import { useNotifyMutationError, useNotifySaved } from "@/_core/hooks/useNotifySaved";
+import { usePrintPresetsList } from "@/_core/hooks/usePrintPresets";
+import { useCreateQuote, useQuoteById, useUpdateQuote } from "@/_core/hooks/useQuotes";
+import { useSettings } from "@/_core/hooks/useSettings";
 import {
   BlankSnapshot,
   PrintSnapshot,
@@ -26,7 +30,8 @@ import {
   formatQtySummary,
   totalQty,
 } from "@/lib/pricing";
-import { ArrowLeft, ChevronRight, Edit2, Plus, Trash2, X } from "lucide-react";
+import { clearDraft, loadDraft } from "@/lib/quoteDraft";
+import { ArrowLeft, ChevronRight, Edit2, Plus, Trash2 } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { useLocation, useParams } from "wouter";
 import { toast } from "sonner";
@@ -35,8 +40,25 @@ type Step = "items" | "pricing" | "review";
 
 const MARGIN_STEPS = [10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80];
 
-function emptyItem(): QuoteItemDraft {
-  return { qtyS: 0, qtyM: 0, qtyL: 0, qtyXL: 0, qty2XL: 0, qty3XL: 0, qty4XL: 0, prints: [], lineNotes: "" };
+// UI-only augmentation: tracks which catalog item is selected, including
+// system items where blankId/presetId stay undefined (no FK row to point at).
+// Stripped before sending to the server.
+type DraftPrintUI = QuoteItemDraft["prints"][number] & { catalogKey?: string };
+type ItemDraftUI = Omit<QuoteItemDraft, "prints"> & {
+  prints: DraftPrintUI[];
+  blankCatalogKey?: string;
+};
+
+function emptyItem(): ItemDraftUI {
+  return { qtyOS: 0, qtyXS: 0, qtyS: 0, qtyM: 0, qtyL: 0, qtyXL: 0, qty2XL: 0, qty3XL: 0, qty4XL: 0, qty5XL: 0, prints: [], lineNotes: "" };
+}
+
+function stripDraftUI(item: ItemDraftUI): QuoteItemDraft {
+  const { blankCatalogKey: _bk, prints, ...rest } = item;
+  return {
+    ...rest,
+    prints: prints.map(({ catalogKey: _ck, ...p }) => p),
+  };
 }
 
 export default function QuoteBuilderPage() {
@@ -45,22 +67,22 @@ export default function QuoteBuilderPage() {
   const quoteId = params.id ? parseInt(params.id) : undefined;
   const isEditing = !!quoteId;
 
-  // Load existing quote for editing
-  const { data: existingQuote } = trpc.quotes.get.useQuery(
-    { id: quoteId! },
-    { enabled: isEditing }
-  );
-  const { data: settings } = trpc.settings.get.useQuery();
-  const { data: blanks } = trpc.blanks.list.useQuery({});
-  const { data: printPresets } = trpc.printPresets.list.useQuery();
+  const notifySaved = useNotifySaved();
+  const notifyError = useNotifyMutationError();
+
+  // Load existing quote for editing — works for both authed (DB) and anon (localStorage)
+  const { data: existingQuote } = useQuoteById(quoteId ?? 0, { enabled: isEditing });
+  const { data: settings } = useSettings();
+  const { data: blanks } = useBlanksList({});
+  const { data: printPresets } = usePrintPresetsList();
 
   // Steps
   const [step, setStep] = useState<Step>("items");
 
   // Items state
-  const [items, setItems] = useState<QuoteItemDraft[]>([]);
+  const [items, setItems] = useState<ItemDraftUI[]>([]);
   const [editingItemIdx, setEditingItemIdx] = useState<number | null>(null);
-  const [itemDraft, setItemDraft] = useState<QuoteItemDraft>(emptyItem());
+  const [itemDraft, setItemDraft] = useState<ItemDraftUI>(emptyItem());
   const [showItemForm, setShowItemForm] = useState(false);
 
   // Pricing state
@@ -92,9 +114,12 @@ export default function QuoteBuilderPage() {
       setCustomerPhone(existingQuote.customerPhone ?? "");
       setCustomerEmail(existingQuote.customerEmail ?? "");
       setNotes(existingQuote.notes ?? "");
-      const loadedItems: QuoteItemDraft[] = (existingQuote.items ?? []).map((item) => ({
+      const loadedItems: ItemDraftUI[] = (existingQuote.items ?? []).map((item) => ({
         blankId: item.blankId ?? undefined,
+        blankCatalogKey: item.blankId ? String(item.blankId) : undefined,
         blankSnapshot: item.blankSnapshot as BlankSnapshot | undefined,
+        qtyOS: item.qtyOS ?? 0,
+        qtyXS: item.qtyXS ?? 0,
         qtyS: item.qtyS ?? 0,
         qtyM: item.qtyM ?? 0,
         qtyL: item.qtyL ?? 0,
@@ -102,9 +127,11 @@ export default function QuoteBuilderPage() {
         qty2XL: item.qty2XL ?? 0,
         qty3XL: item.qty3XL ?? 0,
         qty4XL: item.qty4XL ?? 0,
+        qty5XL: item.qty5XL ?? 0,
         lineNotes: item.lineNotes ?? "",
         prints: (item.prints ?? []).map((p) => ({
           presetId: p.presetId ?? undefined,
+          catalogKey: p.presetId ? String(p.presetId) : undefined,
           presetSnapshot: p.presetSnapshot as PrintSnapshot | undefined,
           cost: p.cost ?? "0",
         })),
@@ -113,25 +140,30 @@ export default function QuoteBuilderPage() {
     }
   }, [existingQuote]);
 
+  // Restore an anonymous draft after the user signs up / logs back in.
+  useEffect(() => {
+    if (isEditing) return;
+    const draft = loadDraft();
+    if (!draft) return;
+    setMargin(draft.margin);
+    setTaxEnabled(draft.taxEnabled);
+    setTaxRate(draft.taxRate);
+    setCustomerName(draft.customerName);
+    setCustomerPhone(draft.customerPhone);
+    setCustomerEmail(draft.customerEmail);
+    setNotes(draft.notes);
+    setItems(draft.items as ItemDraftUI[]);
+    clearDraft();
+    toast.success("Draft restored — hit Save Quote when you're ready");
+  }, [isEditing]);
+
   const totals = useMemo(
-    () => calcQuoteTotals(items, margin, parseFloat(taxRate) || 0, taxEnabled),
+    () => calcQuoteTotals(items as QuoteItemDraft[], margin, parseFloat(taxRate) || 0, taxEnabled),
     [items, margin, taxRate, taxEnabled]
   );
 
-  const createMutation = trpc.quotes.create.useMutation({
-    onSuccess: (data) => {
-      toast.success(`Quote ${data.quoteNumber} created`);
-      setLocation(`/quotes/${data.id}`);
-    },
-    onError: () => toast.error("Failed to save quote"),
-  });
-  const updateMutation = trpc.quotes.update.useMutation({
-    onSuccess: () => {
-      toast.success("Quote updated");
-      setLocation(`/quotes/${quoteId}`);
-    },
-    onError: () => toast.error("Failed to update quote"),
-  });
+  const createMutation = useCreateQuote();
+  const updateMutation = useUpdateQuote();
 
   function openAddItem() {
     setEditingItemIdx(null);
@@ -178,6 +210,8 @@ export default function QuoteBuilderPage() {
       items: items.map((item) => ({
         blankId: item.blankId,
         blankSnapshot: item.blankSnapshot,
+        qtyOS: item.qtyOS,
+        qtyXS: item.qtyXS,
         qtyS: item.qtyS,
         qtyM: item.qtyM,
         qtyL: item.qtyL,
@@ -185,10 +219,11 @@ export default function QuoteBuilderPage() {
         qty2XL: item.qty2XL,
         qty3XL: item.qty3XL,
         qty4XL: item.qty4XL,
+        qty5XL: item.qty5XL,
         lineNotes: item.lineNotes,
-        blankCost: calcBlankCost(item).toFixed(2),
-        printCost: calcPrintCost(item).toFixed(2),
-        lineTotal: calcLineTotal(item, margin).toFixed(2),
+        blankCost: calcBlankCost(item as QuoteItemDraft).toFixed(2),
+        printCost: calcPrintCost(item as QuoteItemDraft).toFixed(2),
+        lineTotal: calcLineTotal(item as QuoteItemDraft, margin).toFixed(2),
         prints: item.prints.map((p) => ({
           presetId: p.presetId,
           presetSnapshot: p.presetSnapshot,
@@ -198,9 +233,24 @@ export default function QuoteBuilderPage() {
     };
 
     if (isEditing) {
-      updateMutation.mutate({ id: quoteId!, ...payload });
+      updateMutation.mutate(
+        { id: quoteId!, ...payload },
+        {
+          onSuccess: () => {
+            notifySaved("Quote updated");
+            setLocation(`/quotes/${quoteId}`);
+          },
+          onError: (err) => notifyError(err, "Failed to update quote"),
+        }
+      );
     } else {
-      createMutation.mutate(payload);
+      createMutation.mutate(payload, {
+        onSuccess: (data) => {
+          notifySaved(`Quote ${data.quoteNumber} created`);
+          setLocation(`/quotes/${data.id}`);
+        },
+        onError: (err) => notifyError(err, "Failed to save quote"),
+      });
     }
   }
 
@@ -521,25 +571,31 @@ export default function QuoteBuilderPage() {
             <div className="space-y-2">
               <Label className="text-xs font-semibold">Select Blank *</Label>
               <Select
-                value={itemDraft.blankId ? String(itemDraft.blankId) : "custom"}
+                value={itemDraft.blankCatalogKey ?? "custom"}
                 onValueChange={(v) => {
                   if (v === "custom") {
-                    setItemDraft({ ...itemDraft, blankId: undefined, blankSnapshot: undefined });
+                    setItemDraft({ ...itemDraft, blankId: undefined, blankCatalogKey: undefined, blankSnapshot: undefined });
                   } else {
-                    const blank = blanks?.find((b) => b.id === parseInt(v));
+                    const blank = blanks?.find((b) => String(b.id) === v);
                     if (blank) {
+                      const dbId = typeof blank.id === "number" ? blank.id : undefined;
                       setItemDraft({
                         ...itemDraft,
-                        blankId: blank.id,
+                        blankId: dbId,
+                        blankCatalogKey: v,
                         blankSnapshot: {
                           brand: blank.brand,
                           garmentType: blank.garmentType,
                           modelName: blank.modelName,
                           variant: blank.variant ?? undefined,
+                          isOneSize: blank.isOneSize,
+                          priceOS: blank.priceOS,
+                          priceXS: blank.priceXS ?? "0",
                           priceSXL: blank.priceSXL ?? "0",
                           price2XL: blank.price2XL ?? "0",
                           price3XL: blank.price3XL ?? "0",
-                          price4XLPlus: blank.price4XLPlus ?? "0",
+                          price4XL: blank.price4XL ?? "0",
+                          price5XL: blank.price5XL ?? "0",
                         },
                       });
                     }
@@ -551,7 +607,7 @@ export default function QuoteBuilderPage() {
                 </SelectTrigger>
                 <SelectContent>
                   {blanks?.map((b) => (
-                    <SelectItem key={b.id} value={String(b.id)}>
+                    <SelectItem key={String(b.id)} value={String(b.id)}>
                       {b.brand} {b.modelName}{b.variant ? ` (${b.variant})` : ""} — ${b.priceSXL}
                     </SelectItem>
                   ))}
@@ -560,66 +616,119 @@ export default function QuoteBuilderPage() {
               </Select>
 
               {/* Custom blank fields */}
-              {!itemDraft.blankId && (
-                <div className="grid grid-cols-2 gap-2 mt-2">
-                  <Input
-                    placeholder="Brand"
-                    className="h-9"
-                    value={itemDraft.blankSnapshot?.brand ?? ""}
-                    onChange={(e) => setItemDraft({ ...itemDraft, blankSnapshot: { ...(itemDraft.blankSnapshot ?? { brand: "", garmentType: "", modelName: "", priceSXL: "0", price2XL: "0", price3XL: "0", price4XLPlus: "0" }), brand: e.target.value } })}
-                  />
-                  <Input
-                    placeholder="Model name"
-                    className="h-9"
-                    value={itemDraft.blankSnapshot?.modelName ?? ""}
-                    onChange={(e) => setItemDraft({ ...itemDraft, blankSnapshot: { ...(itemDraft.blankSnapshot ?? { brand: "", garmentType: "", modelName: "", priceSXL: "0", price2XL: "0", price3XL: "0", price4XLPlus: "0" }), modelName: e.target.value } })}
-                  />
-                  <div className="relative">
-                    <span className="absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground text-sm">$</span>
-                    <Input
-                      placeholder="S-XL price"
-                      className="h-9 pl-6"
-                      type="number" step="0.01" min="0"
-                      value={itemDraft.blankSnapshot?.priceSXL ?? ""}
-                      onChange={(e) => setItemDraft({ ...itemDraft, blankSnapshot: { ...(itemDraft.blankSnapshot ?? { brand: "", garmentType: "", modelName: "", priceSXL: "0", price2XL: "0", price3XL: "0", price4XLPlus: "0" }), priceSXL: e.target.value } })}
-                    />
+              {!itemDraft.blankCatalogKey && (() => {
+                // Empty strings (not "0") so the placeholder text shows until the user types.
+                // Server's optionalPrice transform coerces "" → "0" on save.
+                const emptySnap: BlankSnapshot = {
+                  brand: "", garmentType: "", modelName: "",
+                  priceXS: "", priceSXL: "", price2XL: "", price3XL: "", price4XL: "", price5XL: "",
+                };
+                const snap = itemDraft.blankSnapshot ?? emptySnap;
+                const updateSnap = (partial: Partial<BlankSnapshot>) =>
+                  setItemDraft({ ...itemDraft, blankSnapshot: { ...snap, ...partial } });
+
+                return (
+                  <div className="space-y-3 mt-2">
+                    <div className="grid grid-cols-2 gap-3">
+                      <div className="space-y-1.5">
+                        <Label className="text-xs text-muted-foreground">Brand</Label>
+                        <Input
+                          placeholder="e.g. Gildan"
+                          className="h-9"
+                          value={snap.brand}
+                          onChange={(e) => updateSnap({ brand: e.target.value })}
+                        />
+                      </div>
+                      <div className="space-y-1.5">
+                        <Label className="text-xs text-muted-foreground">Model name</Label>
+                        <Input
+                          placeholder="e.g. 5000"
+                          className="h-9"
+                          value={snap.modelName}
+                          onChange={(e) => updateSnap({ modelName: e.target.value })}
+                        />
+                      </div>
+                    </div>
+                    <div>
+                      <Label className="text-xs font-medium mb-2 block">Pricing <span className="text-muted-foreground font-normal">(leave blank if unsupported)</span></Label>
+                      <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
+                        {([
+                          ["XS", "priceXS"],
+                          ["S – XL", "priceSXL"],
+                          ["2XL", "price2XL"],
+                          ["3XL", "price3XL"],
+                          ["4XL", "price4XL"],
+                          ["5XL", "price5XL"],
+                        ] as const).map(([label, key]) => (
+                          <div key={key} className="space-y-1.5">
+                            <Label className="text-xs text-muted-foreground">{label}</Label>
+                            <div className="relative">
+                              <span className="absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground text-sm">$</span>
+                              <Input
+                                placeholder="0.00"
+                                className="h-9 pl-6"
+                                type="number" step="0.01" min="0"
+                                value={snap[key] ?? ""}
+                                onChange={(e) => updateSnap({ [key]: e.target.value } as Partial<BlankSnapshot>)}
+                              />
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
                   </div>
-                  <div className="relative">
-                    <span className="absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground text-sm">$</span>
-                    <Input
-                      placeholder="2XL+ price"
-                      className="h-9 pl-6"
-                      type="number" step="0.01" min="0"
-                      value={itemDraft.blankSnapshot?.price2XL ?? ""}
-                      onChange={(e) => setItemDraft({ ...itemDraft, blankSnapshot: { ...(itemDraft.blankSnapshot ?? { brand: "", garmentType: "", modelName: "", priceSXL: "0", price2XL: "0", price3XL: "0", price4XLPlus: "0" }), price2XL: e.target.value, price3XL: e.target.value, price4XLPlus: e.target.value } })}
-                    />
-                  </div>
-                </div>
-              )}
+                );
+              })()}
             </div>
 
-            {/* Size breakdown */}
-            <div className="space-y-2">
-              <Label className="text-xs font-semibold">Size Breakdown *</Label>
-              <div className="grid grid-cols-4 gap-2 sm:grid-cols-7">
-                {SIZE_KEYS.map((key) => (
-                  <div key={key} className="space-y-1">
-                    <Label className="text-[10px] text-muted-foreground text-center block">{SIZE_LABELS[key]}</Label>
-                    <Input
-                      type="number"
-                      min="0"
-                      value={itemDraft[key] || ""}
-                      onChange={(e) => setItemDraft({ ...itemDraft, [key]: parseInt(e.target.value) || 0 })}
-                      className="h-9 text-center px-1"
-                      placeholder="0"
-                    />
-                  </div>
-                ))}
+            {/* Size breakdown — one input for one-size items, otherwise 9
+                inputs grouped visually (S/M/L/XL share the priceSXL tier). */}
+            {itemDraft.blankSnapshot?.isOneSize ? (
+              <div className="space-y-2">
+                <Label className="text-xs font-semibold">Quantity *</Label>
+                <div className="max-w-[8rem]">
+                  <Label className="text-[10px] text-muted-foreground text-center block">OS</Label>
+                  <Input
+                    type="number"
+                    min="0"
+                    value={itemDraft.qtyOS || ""}
+                    onChange={(e) => setItemDraft({ ...itemDraft, qtyOS: parseInt(e.target.value) || 0 })}
+                    className="h-9 text-center px-1"
+                    placeholder="0"
+                  />
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  One size only · Total: <span className="font-medium text-foreground">{totalQty(itemDraft)} units</span>
+                </p>
               </div>
-              <p className="text-xs text-muted-foreground">
-                Total: <span className="font-medium text-foreground">{totalQty(itemDraft)} units</span>
-              </p>
-            </div>
+            ) : (
+              <div className="space-y-2">
+                <Label className="text-xs font-semibold">Size Breakdown *</Label>
+                <div className="grid grid-cols-3 sm:grid-cols-9 gap-2">
+                  {SIZE_KEYS.map((key) => {
+                    const isStandard = key === "qtyS" || key === "qtyM" || key === "qtyL" || key === "qtyXL";
+                    return (
+                      <div key={key} className="space-y-1">
+                        <Label className={`text-[10px] text-center block ${isStandard ? "text-primary/70" : "text-muted-foreground"}`}>
+                          {SIZE_LABELS[key]}
+                        </Label>
+                        <Input
+                          type="number"
+                          min="0"
+                          value={itemDraft[key] || ""}
+                          onChange={(e) => setItemDraft({ ...itemDraft, [key]: parseInt(e.target.value) || 0 })}
+                          className="h-9 text-center px-1"
+                          placeholder="0"
+                        />
+                      </div>
+                    );
+                  })}
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  S–XL share one price tier · Total: <span className="font-medium text-foreground">{totalQty(itemDraft)} units</span>
+                </p>
+              </div>
+            )}
 
             {/* Print locations */}
             <div className="space-y-2">
@@ -629,28 +738,31 @@ export default function QuoteBuilderPage() {
               ) : (
                 <div className="space-y-2">
                   {printPresets!.map((preset) => {
-                    const isSelected = itemDraft.prints.some((p) => p.presetId === preset.id);
+                    const presetKey = String(preset.id);
+                    const isSelected = itemDraft.prints.some((p) => p.catalogKey === presetKey);
                     return (
                       <div
-                        key={preset.id}
+                        key={presetKey}
                         className={`flex items-center gap-3 p-3 rounded-lg border cursor-pointer transition-all ${
                           isSelected ? "border-primary/50 bg-primary/5" : "border-border hover:border-border/80"
                         }`}
                         onClick={() => {
                           if (isSelected) {
-                            setItemDraft({ ...itemDraft, prints: itemDraft.prints.filter((p) => p.presetId !== preset.id) });
+                            setItemDraft({ ...itemDraft, prints: itemDraft.prints.filter((p) => p.catalogKey !== presetKey) });
                           } else {
-                            const qty = totalQty(itemDraft);
+                            const qty = totalQty(itemDraft as QuoteItemDraft);
                             const perPrint = parseFloat(preset.perPrintCost ?? "0");
                             const setup = parseFloat(preset.setupFee ?? "0");
                             const ink = parseFloat(preset.inkCost ?? "0");
                             const cost = ((ink + perPrint) * qty + setup).toFixed(2);
+                            const dbId = typeof preset.id === "number" ? preset.id : undefined;
                             setItemDraft({
                               ...itemDraft,
                               prints: [
                                 ...itemDraft.prints,
                                 {
-                                  presetId: preset.id,
+                                  presetId: dbId,
+                                  catalogKey: presetKey,
                                   presetSnapshot: {
                                     name: preset.name,
                                     inkCost: preset.inkCost ?? "0",
@@ -713,6 +825,7 @@ export default function QuoteBuilderPage() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
     </div>
   );
 }

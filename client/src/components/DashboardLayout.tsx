@@ -21,15 +21,18 @@ import {
   useSidebar,
 } from "@/components/ui/sidebar";
 import { useIsMobile } from "@/hooks/useMobile";
+import { APP_NAME } from "@shared/constants";
 import { BookOpen, DollarSign, FileText, LogIn, LogOut, PanelLeft, Settings } from "lucide-react";
 import { CSSProperties, useEffect, useRef, useState } from "react";
 import { useLocation } from "wouter";
+import { AnonymousBanner } from "./AnonymousBanner";
 import { DashboardLayoutSkeleton } from "./DashboardLayoutSkeleton";
 import { Button } from "./ui/button";
 
-const APP_NAME = "Quote Calculator";
-
-const menuItems = [
+// Anonymous users get the same nav as authed users — the calculator works as
+// a localStorage-backed sandbox. The footer area still differentiates by
+// showing user info vs Sign in/Create account CTAs.
+const MENU_ITEMS = [
   { icon: FileText, label: "Quotes", path: "/" },
   { icon: BookOpen, label: "Blanks Library", path: "/blanks" },
   { icon: DollarSign, label: "Print Costs", path: "/print-costs" },
@@ -78,7 +81,7 @@ function DashboardLayoutContent({
   const sidebarRef = useRef<HTMLDivElement>(null);
   const isMobile = useIsMobile();
 
-  const activeMenuItem = menuItems.find((item) =>
+  const activeMenuItem = MENU_ITEMS.find((item) =>
     item.path === "/" ? location === "/" : location.startsWith(item.path)
   );
 
@@ -143,7 +146,7 @@ function DashboardLayoutContent({
           {/* Nav */}
           <SidebarContent className="gap-0 pt-2">
             <SidebarMenu className="px-2 gap-0.5">
-              {menuItems.map((item) => {
+              {MENU_ITEMS.map((item) => {
                 const isActive = item.path === "/" ? location === "/" : location.startsWith(item.path);
                 return (
                   <SidebarMenuItem key={item.path}>
@@ -261,6 +264,10 @@ function DashboardLayoutContent({
       </div>
 
       <SidebarInset className="bg-background">
+        {/* Banner pushes content down (never overlays). Hidden when authed
+            or when previously dismissed. */}
+        <AnonymousBanner />
+
         {/* Mobile top bar */}
         {isMobile && (
           <div className="flex border-b border-border/60 h-14 items-center justify-between bg-background/95 px-4 backdrop-blur supports-[backdrop-filter]:backdrop-blur sticky top-0 z-40">

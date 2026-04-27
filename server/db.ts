@@ -1,5 +1,5 @@
 import "dotenv/config";
-import { and, desc, eq, ilike, or } from "drizzle-orm";
+import { and, desc, eq, ilike, inArray, or, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/postgres-js";
 import postgres from "postgres";
 import {
@@ -80,7 +80,39 @@ export async function getBlanks(
     .select()
     .from(blanks)
     .where(and(...conditions))
-    .orderBy(blanks.brand, blanks.modelName);
+    .orderBy(blanks.sortOrder, blanks.brand, blanks.modelName);
+}
+
+export async function getMaxBlankSortOrder(userId: string): Promise<number> {
+  const result = await db
+    .select({ max: sql<number | null>`MAX(${blanks.sortOrder})` })
+    .from(blanks)
+    .where(eq(blanks.userId, userId));
+  return result[0]?.max ?? -1;
+}
+
+export async function reorderBlanks(
+  userId: string,
+  items: Array<{ id: number; sortOrder: number }>,
+): Promise<void> {
+  if (items.length === 0) return;
+  const ids = items.map((i) => i.id);
+  // Validate ownership: every id we're about to update must belong to userId.
+  const owned = await db
+    .select({ id: blanks.id })
+    .from(blanks)
+    .where(and(inArray(blanks.id, ids), eq(blanks.userId, userId)));
+  if (owned.length !== ids.length) {
+    throw new Error("reorderBlanks: not all ids owned by user");
+  }
+  await db.transaction(async (tx) => {
+    for (const item of items) {
+      await tx
+        .update(blanks)
+        .set({ sortOrder: item.sortOrder })
+        .where(and(eq(blanks.id, item.id), eq(blanks.userId, userId)));
+    }
+  });
 }
 
 export async function getBlankById(id: number, userId: string): Promise<Blank | undefined> {
@@ -118,16 +150,37 @@ export async function getBlankBrands(userId: string): Promise<string[]> {
   const result = await db
     .selectDistinct({ brand: blanks.brand })
     .from(blanks)
-    .where(eq(blanks.userId, userId))
+    .where(and(eq(blanks.userId, userId), eq(blanks.isHidden, false)))
     .orderBy(blanks.brand);
   return result.map((r) => r.brand);
+}
+
+export async function findBlankBySystemId(
+  userId: string,
+  systemId: string
+): Promise<Blank | undefined> {
+  const result = await db
+    .select()
+    .from(blanks)
+    .where(and(eq(blanks.userId, userId), eq(blanks.overridesSystemId, systemId)))
+    .limit(1);
+  return result[0];
+}
+
+export async function deleteBlankBySystemId(
+  userId: string,
+  systemId: string
+): Promise<void> {
+  await db
+    .delete(blanks)
+    .where(and(eq(blanks.userId, userId), eq(blanks.overridesSystemId, systemId)));
 }
 
 export async function getBlankGarmentTypes(userId: string): Promise<string[]> {
   const result = await db
     .selectDistinct({ garmentType: blanks.garmentType })
     .from(blanks)
-    .where(eq(blanks.userId, userId))
+    .where(and(eq(blanks.userId, userId), eq(blanks.isHidden, false)))
     .orderBy(blanks.garmentType);
   return result.map((r) => r.garmentType);
 }
@@ -139,7 +192,38 @@ export async function getPrintPresets(userId: string): Promise<PrintPreset[]> {
     .select()
     .from(printPresets)
     .where(eq(printPresets.userId, userId))
-    .orderBy(printPresets.name);
+    .orderBy(printPresets.sortOrder, printPresets.name);
+}
+
+export async function getMaxPrintPresetSortOrder(userId: string): Promise<number> {
+  const result = await db
+    .select({ max: sql<number | null>`MAX(${printPresets.sortOrder})` })
+    .from(printPresets)
+    .where(eq(printPresets.userId, userId));
+  return result[0]?.max ?? -1;
+}
+
+export async function reorderPrintPresets(
+  userId: string,
+  items: Array<{ id: number; sortOrder: number }>,
+): Promise<void> {
+  if (items.length === 0) return;
+  const ids = items.map((i) => i.id);
+  const owned = await db
+    .select({ id: printPresets.id })
+    .from(printPresets)
+    .where(and(inArray(printPresets.id, ids), eq(printPresets.userId, userId)));
+  if (owned.length !== ids.length) {
+    throw new Error("reorderPrintPresets: not all ids owned by user");
+  }
+  await db.transaction(async (tx) => {
+    for (const item of items) {
+      await tx
+        .update(printPresets)
+        .set({ sortOrder: item.sortOrder })
+        .where(and(eq(printPresets.id, item.id), eq(printPresets.userId, userId)));
+    }
+  });
 }
 
 export async function getPrintPresetById(
@@ -177,6 +261,27 @@ export async function deletePrintPreset(id: number, userId: string): Promise<voi
   await db
     .delete(printPresets)
     .where(and(eq(printPresets.id, id), eq(printPresets.userId, userId)));
+}
+
+export async function findPrintPresetBySystemId(
+  userId: string,
+  systemId: string
+): Promise<PrintPreset | undefined> {
+  const result = await db
+    .select()
+    .from(printPresets)
+    .where(and(eq(printPresets.userId, userId), eq(printPresets.overridesSystemId, systemId)))
+    .limit(1);
+  return result[0];
+}
+
+export async function deletePrintPresetBySystemId(
+  userId: string,
+  systemId: string
+): Promise<void> {
+  await db
+    .delete(printPresets)
+    .where(and(eq(printPresets.userId, userId), eq(printPresets.overridesSystemId, systemId)));
 }
 
 // ─── Quotes ───────────────────────────────────────────────────────────────────
