@@ -108,9 +108,10 @@ export function calcPrintCost(item: QuoteItemDraft): number {
   return item.prints.reduce((sum, p) => {
     const snap = p.presetSnapshot;
     if (!snap) return sum + (parseFloat(p.cost) || 0);
+    const ink = parseFloat(snap.inkCost) || 0;
     const perPrint = parseFloat(snap.perPrintCost) || 0;
     const setup = parseFloat(snap.setupFee) || 0;
-    return sum + perPrint * totalQty + setup;
+    return sum + (ink + perPrint) * totalQty + setup;
   }, 0);
 }
 
